@@ -4,186 +4,211 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from main import Settings, TelegramAPIError, TelegramBotAPI, handle_message, load_settings, verify_targets
+from main import (
+    Settings,
+    TelegramAPIError,
+    TelegramBotAPI,
+    _command,
+    handle_message,
+    load_settings,
+    prepare,
+    verify_targets,
+)
 
 
-class Response:
-    def __init__(self, payload, status=200):
-        self.payload = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
-        self.status = status
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
-
-    def read(self):
-        return self.payload
-
-
-def http_error(code, body):
-    raw = body if isinstance(body, bytes) else json.dumps(body).encode()
-    return urllib.error.HTTPError("https://api.telegram.org/test", code, "error", {}, io.BytesIO(raw))
-
-
-class RecordingAPI:
-    def __init__(self, outcomes):
-        self.outcomes = list(outcomes)
+class ScriptedAPI:
+    def __init__(self, verification_results=None):
+        self.verification_results = verification_results or {}
         self.verified = []
         self.messages = []
+        self.get_me_result = {"id": 777, "is_bot": True, "username": "verifier"}
+        self.webhook_deleted = False
 
     def verify_user(self, user_id):
         self.verified.append(user_id)
-        if not self.outcomes:
-            raise AssertionError("Unexpected verify_user call")
-        outcome = self.outcomes.pop(0)
-        if isinstance(outcome, Exception):
-            raise outcome
-        if outcome is not True:
-            raise TelegramAPIError("verifyUser did not return True")
-        return True
+        result = self.verification_results.get(user_id, True)
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     def send_message(self, chat_id, text):
         self.messages.append((chat_id, text))
 
+    def get_me(self):
+        if isinstance(self.get_me_result, Exception):
+            raise self.get_me_result
+        return self.get_me_result
 
-class SettingsTests(unittest.TestCase):
-    def test_requires_token(self):
-        with self.assertRaises(ValueError):
-            load_settings({"VERIFICATION_OWNER_IDS": "1,2"})
-
-    def test_requires_exactly_two_distinct_owners(self):
-        settings = load_settings({
-            "TELEGRAM_BOT_TOKEN": "t",
-            "VERIFICATION_OWNER_IDS": "1,2",
-            "VERIFICATION_EXECUTIVE_IDS": "2,3,3",
-        })
-        self.assertEqual(settings.owner_ids, (1, 2))
-        self.assertEqual(settings.targets, (1, 2, 3))
-        with self.assertRaises(ValueError):
-            load_settings({"TELEGRAM_BOT_TOKEN": "t", "VERIFICATION_OWNER_IDS": "1,1"})
-
-    def test_rejects_invalid_ids(self):
-        for bad in ["x,2", "0,2", "-1,2"]:
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                load_settings({"TELEGRAM_BOT_TOKEN": "t", "VERIFICATION_OWNER_IDS": bad})
+    def delete_webhook(self):
+        self.webhook_deleted = True
 
 
-class TransportTests(unittest.TestCase):
-    @patch("main.urllib.request.urlopen")
-    def test_verify_user_sends_real_method_and_payload_shape(self, urlopen):
-        urlopen.return_value = Response({"ok": True, "result": True})
+class Response:
+    def __init__(self, payload):
+        self.payload = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+class FinalDeliveryTests(unittest.TestCase):
+    """Treat a wrong final state as total failure, not as a partial pass."""
+
+    def test_owner_command_requires_every_target_to_succeed_before_claiming_total_success(self):
+        api = ScriptedAPI({1: True, 2: True, 3: True})
+        settings = Settings("token", (1, 2), (3,))
+        handle_message(api, settings, {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1}})
+        self.assertEqual(api.verified, [1, 2, 3])
+        self.assertEqual(api.messages[-1][1], "Verificação concluída com sucesso para todos os 3 alvos.")
+
+    def test_partial_failure_can_never_claim_total_success(self):
+        api = ScriptedAPI({1: True, 2: False, 3: True})
+        settings = Settings("token", (1, 2), (3,))
+        handle_message(api, settings, {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1}})
+        self.assertEqual(api.verified, [1, 2, 3])
+        self.assertEqual(api.messages[-1][1], "Verificação incompleta. Sucesso: 2. Falhas: 1. Total: 3.")
+
+    def test_startup_requires_real_bot_identity_and_polling_compatibility(self):
+        api = ScriptedAPI()
+        identity = prepare(api)
+        self.assertEqual(identity["id"], 777)
+        self.assertTrue(api.webhook_deleted)
+
+    def test_non_owner_never_reaches_verification(self):
+        api = ScriptedAPI()
+        settings = Settings("token", (1, 2), (3,))
+        handle_message(api, settings, {"text": "/verify", "from": {"id": 99}, "chat": {"id": 99}})
+        self.assertEqual(api.verified, [])
+        self.assertEqual(api.messages[-1][1], "Ação não autorizada.")
+
+
+class RiskFocusedTests(unittest.TestCase):
+    """Prefer failure-prone protocol boundaries over comfortable syntax checks."""
+
+    def test_verify_user_calls_exact_official_method_and_payload_and_requires_literal_true(self):
         api = TelegramBotAPI("secret")
-        self.assertTrue(api.verify_user(123456789))
+        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": True})) as urlopen:
+            self.assertTrue(api.verify_user(123456789))
         request = urlopen.call_args.args[0]
         self.assertTrue(request.full_url.endswith("/verifyUser"))
-        self.assertEqual(json.loads(request.data), {"user_id": 123456789})
+        self.assertEqual(json.loads(request.data.decode()), {"user_id": 123456789})
 
-    @patch("main.urllib.request.urlopen")
-    def test_http_400_permission_error_is_not_success(self, urlopen):
-        urlopen.side_effect = http_error(400, {
-            "ok": False,
-            "error_code": 400,
-            "description": "Bad Request: BOT_VERIFIER_FORBIDDEN",
-        })
-        with self.assertRaises(TelegramAPIError) as ctx:
-            TelegramBotAPI("secret").verify_user(1)
-        self.assertIn("BOT_VERIFIER_FORBIDDEN", ctx.exception.description)
-        self.assertEqual(ctx.exception.error_code, 400)
+        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": {"unexpected": True}})):
+            self.assertFalse(api.verify_user(123456789))
 
-    @patch("main.urllib.request.urlopen")
-    def test_http_429_parameters_are_preserved(self, urlopen):
-        urlopen.side_effect = http_error(429, {
-            "ok": False,
-            "error_code": 429,
-            "description": "Too Many Requests",
-            "parameters": {"retry_after": 7},
-        })
-        with self.assertRaises(TelegramAPIError) as ctx:
-            TelegramBotAPI("secret").verify_user(1)
-        self.assertEqual(ctx.exception.error_code, 429)
-        self.assertEqual(ctx.exception.parameters["retry_after"], 7)
+    def test_malformed_json_is_failure(self):
+        api = TelegramBotAPI("secret")
+        with patch("main.urllib.request.urlopen", return_value=Response(b"not-json")):
+            with self.assertRaisesRegex(TelegramAPIError, "invalid JSON"):
+                api.get_me()
 
-    @patch("main.urllib.request.urlopen")
-    def test_malformed_json_fails_closed(self, urlopen):
-        urlopen.return_value = Response(b"not-json")
-        with self.assertRaises(TelegramAPIError):
-            TelegramBotAPI("secret").verify_user(1)
+    def test_success_without_result_is_failure(self):
+        api = TelegramBotAPI("secret")
+        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True})):
+            with self.assertRaisesRegex(TelegramAPIError, "did not contain result"):
+                api.get_me()
 
-    @patch("main.urllib.request.urlopen")
-    def test_missing_result_fails_closed(self, urlopen):
-        urlopen.return_value = Response({"ok": True})
-        with self.assertRaises(TelegramAPIError):
-            TelegramBotAPI("secret").verify_user(1)
+    def test_get_updates_wrong_shape_is_failure_not_empty_poll(self):
+        api = TelegramBotAPI("secret")
+        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": {}})):
+            with self.assertRaisesRegex(TelegramAPIError, "getUpdates returned an invalid result"):
+                api.get_updates(None)
 
-    @patch("main.urllib.request.urlopen")
-    def test_verify_user_false_is_failure_not_success(self, urlopen):
-        urlopen.return_value = Response({"ok": True, "result": False})
-        with self.assertRaises(TelegramAPIError):
-            TelegramBotAPI("secret").verify_user(1)
+    def test_network_failure_is_not_success(self):
+        api = TelegramBotAPI("secret")
+        with patch("main.urllib.request.urlopen", side_effect=urllib.error.URLError("offline")):
+            with self.assertRaisesRegex(TelegramAPIError, "Network error"):
+                api.verify_user(1)
 
-    @patch("main.urllib.request.urlopen")
-    def test_network_failure_is_failure(self, urlopen):
-        urlopen.side_effect = urllib.error.URLError("offline")
-        with self.assertRaises(TelegramAPIError) as ctx:
-            TelegramBotAPI("secret").verify_user(1)
-        self.assertIn("Network error", ctx.exception.description)
-
-    @patch("main.urllib.request.urlopen")
-    def test_get_me_rejects_invalid_identity(self, urlopen):
-        urlopen.return_value = Response({"ok": True, "result": {"username": "bot"}})
-        with self.assertRaises(TelegramAPIError):
-            TelegramBotAPI("secret").get_me()
-
-
-class FlowFailureTests(unittest.TestCase):
-    def test_non_owner_never_reaches_verify(self):
-        api = RecordingAPI([])
-        handle_message(
-            api,
-            Settings("t", (1, 2), (3,)),
-            {"text": "/verify", "from": {"id": 99}, "chat": {"id": 99}},
-        )
-        self.assertEqual(api.verified, [])
-        self.assertIn("não autorizada", api.messages[-1][1])
-
-    def test_all_success_requires_every_target_to_succeed(self):
-        api = RecordingAPI([True, True, True])
-        handle_message(
-            api,
-            Settings("t", (1, 2), (2, 3)),
-            {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1}},
-        )
-        self.assertEqual(api.verified, [1, 2, 3])
-        self.assertIn("todos os 3 alvos", api.messages[-1][1])
-
-    def test_partial_failure_cannot_report_total_success(self):
-        api = RecordingAPI([True, TelegramAPIError("server failure", 500), True])
-        handle_message(
-            api,
-            Settings("t", (1, 2), (3,)),
-            {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1}},
-        )
-        self.assertEqual(api.verified, [1, 2, 3])
-        self.assertIn("incompleta", api.messages[-1][1])
-        self.assertIn("Falhas: 1", api.messages[-1][1])
-        self.assertNotIn("todos", api.messages[-1][1])
-
-    def test_permission_missing_stops_immediately_and_never_reports_success(self):
-        api = RecordingAPI([TelegramAPIError("Bad Request: BOT_VERIFIER_FORBIDDEN", 400), True])
-        result = verify_targets(api, [1, 2])
-        self.assertEqual(result, (0, 1, True))
+    def test_realistic_permission_error_stops_batch(self):
+        api = ScriptedAPI({1: TelegramAPIError("Forbidden: BOT_VERIFIER_FORBIDDEN", 403)})
+        self.assertEqual(verify_targets(api, [1, 2, 3]), (0, 1, True))
         self.assertEqual(api.verified, [1])
 
     @patch("main.time.sleep")
-    def test_rate_limit_retries_and_second_failure_remains_failure(self, sleep):
-        api = RecordingAPI([
-            TelegramAPIError("Too Many Requests", 429, {"retry_after": 3}),
-            TelegramAPIError("server failure", 500),
-        ])
-        self.assertEqual(verify_targets(api, [1]), (0, 1, False))
-        sleep.assert_called_once_with(3)
+    def test_rate_limit_retries_only_the_affected_target_once(self, sleep):
+        class RateLimited(ScriptedAPI):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def verify_user(self, user_id):
+                self.verified.append(user_id)
+                self.calls += 1
+                if self.calls == 1:
+                    raise TelegramAPIError("Too Many Requests", 429, {"retry_after": 2})
+                return True
+
+        api = RateLimited()
+        self.assertEqual(verify_targets(api, [10]), (1, 0, False))
+        self.assertEqual(api.verified, [10, 10])
+        sleep.assert_called_once_with(2)
+
+    def test_http_error_json_preserves_telegram_error_code_and_description(self):
+        api = TelegramBotAPI("secret")
+        error_body = io.BytesIO(json.dumps({
+            "ok": False,
+            "error_code": 403,
+            "description": "Forbidden: BOT_VERIFIER_FORBIDDEN",
+        }).encode())
+        http_error = urllib.error.HTTPError("url", 403, "Forbidden", {}, error_body)
+        with patch("main.urllib.request.urlopen", side_effect=http_error):
+            with self.assertRaises(TelegramAPIError) as caught:
+                api.verify_user(1)
+        self.assertEqual(caught.exception.error_code, 403)
+        self.assertIn("BOT_VERIFIER_FORBIDDEN", caught.exception.description)
+
+
+class TransparencyTests(unittest.TestCase):
+    """Failures must remain visible and remediable instead of being softened into a success-looking state."""
+
+    def test_missing_token_fails_before_runtime(self):
+        with self.assertRaisesRegex(ValueError, "TELEGRAM_BOT_TOKEN is required"):
+            load_settings({"VERIFICATION_OWNER_IDS": "1,2"})
+
+    def test_exactly_two_distinct_owners_are_required(self):
+        for raw in ("1", "1,1", ""):
+            with self.subTest(raw=raw):
+                with self.assertRaises(ValueError):
+                    load_settings({"TELEGRAM_BOT_TOKEN": "token", "VERIFICATION_OWNER_IDS": raw})
+
+    def test_invalid_target_id_is_rejected_not_ignored(self):
+        with self.assertRaisesRegex(ValueError, "positive Telegram user IDs"):
+            load_settings({
+                "TELEGRAM_BOT_TOKEN": "token",
+                "VERIFICATION_OWNER_IDS": "1,2",
+                "VERIFICATION_EXECUTIVE_IDS": "-3",
+            })
+
+    def test_targets_are_unique_and_complete(self):
+        settings = load_settings({
+            "TELEGRAM_BOT_TOKEN": "token",
+            "VERIFICATION_OWNER_IDS": "1,2",
+            "VERIFICATION_EXECUTIVE_IDS": "2,3,3,4",
+        })
+        self.assertEqual(settings.targets, (1, 2, 3, 4))
+
+    def test_command_normalization_does_not_expand_authority(self):
+        self.assertEqual(_command("/verify@VerifierBot now"), "/verify")
+        self.assertNotEqual(_command("verify"), "/verify")
+
+    def test_get_me_rejects_non_bot_identity(self):
+        api = TelegramBotAPI("secret")
+        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": {"id": 7, "is_bot": False}})):
+            with self.assertRaisesRegex(TelegramAPIError, "valid bot identity"):
+                api.get_me()
+
+    def test_delete_webhook_must_return_true(self):
+        api = TelegramBotAPI("secret")
+        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": False})):
+            with self.assertRaisesRegex(TelegramAPIError, "deleteWebhook did not return True"):
+                api.delete_webhook()
 
 
 if __name__ == "__main__":
