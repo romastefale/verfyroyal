@@ -23,15 +23,9 @@ from main import (
 class Response:
     def __init__(self, payload):
         self.payload = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
-
-    def read(self):
-        return self.payload
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *_):
-        return False
+    def read(self): return self.payload
+    def __enter__(self): return self
+    def __exit__(self, *_): return False
 
 
 class ScriptedAPI:
@@ -90,13 +84,7 @@ class ContractTests(unittest.TestCase):
         self.api = ScriptedAPI()
         for uid, name in [(1, "Owner One"), (2, "Owner Two"), (3, "Exec Three"), (4, "Exec Four"), (9, "Target Nine")]:
             first, *rest = name.split()
-            self.api.chats[uid] = {
-                "id": uid,
-                "type": "private",
-                "first_name": first,
-                "last_name": " ".join(rest),
-                "username": f"user{uid}",
-            }
+            self.api.chats[uid] = {"id": uid, "type": "private", "first_name": first, "last_name": " ".join(rest), "username": f"user{uid}"}
 
     def tearDown(self):
         self.temp.cleanup()
@@ -120,6 +108,7 @@ class ContractTests(unittest.TestCase):
         self.assertIn("capability_missing", self.api.messages[-1][1])
 
     def test_owner_unverified_blocks_verify(self):
+        # Active capability exists from a different successful subject, but owner 1 has no success record.
         self.mark_verified(2, actor_id=2, mode="owner_self")
         handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
         self.assertEqual(self.api.verify_calls, [])
