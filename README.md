@@ -12,4 +12,4 @@ Nenhum token ou ID real é armazenado no repositório.
 
 ## Execução
 
-### comando
+###### /comando
