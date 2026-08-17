@@ -6,11 +6,11 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Iterable
 
 
 LOGGER = logging.getLogger("verfyroyal")
 _STOP = False
+MAX_TELEGRAM_USER_ID = 0xFFFFFFFFFF
 
 
 class TelegramAPIError(RuntimeError):
@@ -24,7 +24,7 @@ class TelegramAPIError(RuntimeError):
 @dataclass(frozen=True)
 class Settings:
     token: str
-    owner_ids: tuple[int, ...]
+    owner_ids: tuple[int, int]
     executive_ids: tuple[int, ...]
     log_level: str = "INFO"
 
@@ -48,14 +48,15 @@ def _parse_ids(raw: str, name: str, required: bool) -> tuple[int, ...]:
         try:
             value = int(item)
         except ValueError as exc:
-            raise ValueError(f"{name} must contain comma-separated integer Telegram user IDs") from exc
-        if value <= 0:
-            raise ValueError(f"{name} must contain positive Telegram user IDs")
+            raise ValueError(f"{name} must contain comma-separated Telegram user IDs") from exc
+        if not 1 <= value <= MAX_TELEGRAM_USER_ID:
+            raise ValueError(f"{name} contains an invalid Telegram user ID")
         values.append(value)
 
+    values = list(dict.fromkeys(values))
     if required and not values:
         raise ValueError(f"{name} is required")
-    return tuple(dict.fromkeys(values))
+    return tuple(values)
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
@@ -68,9 +69,13 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     if len(owners) != 2:
         raise ValueError("VERIFICATION_OWNER_IDS must contain exactly two distinct owner IDs")
 
-    executives = _parse_ids(source.get("VERIFICATION_EXECUTIVE_IDS", ""), "VERIFICATION_EXECUTIVE_IDS", False)
+    executives = _parse_ids(
+        source.get("VERIFICATION_EXECUTIVE_IDS", ""),
+        "VERIFICATION_EXECUTIVE_IDS",
+        False,
+    )
     level = source.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"
-    return Settings(token=token, owner_ids=owners, executive_ids=executives, log_level=level)
+    return Settings(token, (owners[0], owners[1]), executives, level)
 
 
 class TelegramBotAPI:
@@ -79,50 +84,47 @@ class TelegramBotAPI:
         self.timeout = timeout
 
     def call(self, method: str, payload: dict | None = None) -> object:
-        data = json.dumps(payload or {}).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/{method}",
-            data=data,
+            data=json.dumps(payload or {}).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read().decode("utf-8")
+                raw = response.read()
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="replace")
+            raw = exc.read()
             try:
-                result = json.loads(raw)
-            except json.JSONDecodeError as parse_exc:
-                raise TelegramAPIError(f"Telegram HTTP error {exc.code} with invalid JSON", exc.code) from parse_exc
-            if not isinstance(result, dict):
-                raise TelegramAPIError(f"Telegram HTTP error {exc.code} with invalid response shape", exc.code)
+                body = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as parse_exc:
+                raise TelegramAPIError(f"Telegram HTTP error {exc.code}", exc.code) from parse_exc
+            if not isinstance(body, dict):
+                raise TelegramAPIError(f"Telegram HTTP error {exc.code}", exc.code)
             raise TelegramAPIError(
-                str(result.get("description", f"Telegram HTTP error {exc.code}")),
-                int(result.get("error_code", exc.code)),
-                result.get("parameters") if isinstance(result.get("parameters"), dict) else {},
+                str(body.get("description", f"Telegram HTTP error {exc.code}")),
+                body.get("error_code") if isinstance(body.get("error_code"), int) else exc.code,
+                body.get("parameters") if isinstance(body.get("parameters"), dict) else {},
             )
         except (urllib.error.URLError, TimeoutError) as exc:
             reason = getattr(exc, "reason", str(exc))
             raise TelegramAPIError(f"Network error contacting Telegram: {reason}") from exc
 
         try:
-            result = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            body = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise TelegramAPIError("Telegram returned invalid JSON") from exc
 
-        # A malformed success response is not success. Refuse to infer or coerce it.
-        if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
-            raise TelegramAPIError("Telegram returned an invalid response shape")
-        if result["ok"] is not True:
+        if not isinstance(body, dict) or body.get("ok") is not True:
             raise TelegramAPIError(
-                str(result.get("description", "Telegram API request failed")),
-                result.get("error_code") if isinstance(result.get("error_code"), int) else None,
-                result.get("parameters") if isinstance(result.get("parameters"), dict) else {},
+                str(body.get("description", "Telegram API request failed")) if isinstance(body, dict) else "Telegram returned an invalid response",
+                body.get("error_code") if isinstance(body, dict) and isinstance(body.get("error_code"), int) else None,
+                body.get("parameters") if isinstance(body, dict) and isinstance(body.get("parameters"), dict) else {},
             )
-        if "result" not in result:
+        if "result" not in body:
             raise TelegramAPIError("Telegram success response did not contain result")
-        return result["result"]
+        return body["result"]
 
     def get_me(self) -> dict:
         result = self.call("getMe")
@@ -131,9 +133,7 @@ class TelegramBotAPI:
         return result
 
     def delete_webhook(self) -> None:
-        # getUpdates and webhooks are mutually exclusive. Removing an old webhook makes the chosen polling mode explicit.
-        result = self.call("deleteWebhook", {"drop_pending_updates": False})
-        if result is not True:
+        if self.call("deleteWebhook", {"drop_pending_updates": False}) is not True:
             raise TelegramAPIError("deleteWebhook did not return True")
 
     def get_updates(self, offset: int | None) -> list[dict]:
@@ -145,15 +145,20 @@ class TelegramBotAPI:
             raise TelegramAPIError("getUpdates returned an invalid result")
         return result
 
+    def get_chat(self, user_id: int) -> dict:
+        result = self.call("getChat", {"chat_id": user_id})
+        if not isinstance(result, dict) or result.get("id") != user_id or result.get("type") != "private":
+            raise TelegramAPIError("getChat did not return the expected private user chat")
+        return result
+
     def send_message(self, chat_id: int, text: str) -> None:
         result = self.call("sendMessage", {"chat_id": chat_id, "text": text})
         if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
             raise TelegramAPIError("sendMessage did not return a valid Message")
 
-    def verify_user(self, user_id: int) -> bool:
-        result = self.call("verifyUser", {"user_id": user_id})
-        # Telegram documents verifyUser as returning True on success. False or any other shape is a failed verification.
-        return result is True
+    def verify_user(self, user_id: int) -> None:
+        if self.call("verifyUser", {"user_id": user_id}) is not True:
+            raise TelegramAPIError("verifyUser did not return True")
 
 
 def _command(text: str) -> str:
@@ -161,41 +166,35 @@ def _command(text: str) -> str:
     return first.split("@", 1)[0].lower()
 
 
-def _is_permission_missing(exc: TelegramAPIError) -> bool:
-    return exc.error_code == 403 and "BOT_VERIFIER_FORBIDDEN" in exc.description.upper()
+def _retry_after(exc: TelegramAPIError) -> int | None:
+    if exc.error_code != 429:
+        return None
+    value = exc.parameters.get("retry_after")
+    return value if isinstance(value, int) and value > 0 else 1
 
 
-def verify_targets(api: TelegramBotAPI, targets: Iterable[int]) -> tuple[int, int, bool]:
-    succeeded = 0
-    failed = 0
-    permission_missing = False
-
-    for user_id in targets:
+def _call_with_transient_retry(operation, attempts: int = 3) -> None:
+    for attempt in range(attempts):
         try:
-            if api.verify_user(user_id):
-                succeeded += 1
-            else:
-                failed += 1
+            operation()
+            return
         except TelegramAPIError as exc:
-            if _is_permission_missing(exc):
-                permission_missing = True
-                failed += 1
-                break
-            if exc.error_code == 429:
-                retry_after_raw = exc.parameters.get("retry_after", 1)
-                retry_after = retry_after_raw if isinstance(retry_after_raw, int) and retry_after_raw > 0 else 1
-                time.sleep(retry_after)
-                try:
-                    if api.verify_user(user_id):
-                        succeeded += 1
-                    else:
-                        failed += 1
-                except TelegramAPIError:
-                    failed += 1
-            else:
-                failed += 1
+            wait = _retry_after(exc)
+            transient = wait is not None or exc.error_code is None or (exc.error_code >= 500 if exc.error_code is not None else False)
+            if not transient or attempt == attempts - 1:
+                raise
+            time.sleep(wait if wait is not None else 2 ** attempt)
 
-    return succeeded, failed, permission_missing
+
+def preflight_targets(api: TelegramBotAPI, targets: tuple[int, ...]) -> None:
+    for user_id in targets:
+        api.get_chat(user_id)
+
+
+def verify_all(api: TelegramBotAPI, targets: tuple[int, ...]) -> None:
+    preflight_targets(api, targets)
+    for user_id in targets:
+        _call_with_transient_retry(lambda uid=user_id: api.verify_user(uid))
 
 
 def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> None:
@@ -213,24 +212,24 @@ def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> No
         api.send_message(chat_id, "Ação não autorizada.")
         return
 
-    succeeded, failed, permission_missing = verify_targets(api, settings.targets)
-    if permission_missing:
-        api.send_message(chat_id, "A capacidade oficial de verificador ainda não está ativa para este bot.")
+    try:
+        verify_all(api, settings.targets)
+    except TelegramAPIError as exc:
+        if exc.error_code == 403 and "BOT_VERIFIER_FORBIDDEN" in exc.description.upper():
+            api.send_message(chat_id, "A capacidade oficial de verificador ainda não está ativa para este bot.")
+            return
+        if exc.error_code == 400 and "PEER_ID_INVALID" in exc.description.upper():
+            api.send_message(chat_id, "Um ou mais alvos ainda não estão acessíveis ao bot no Telegram.")
+            return
+        api.send_message(chat_id, "A verificação não foi concluída. Nenhum resultado foi tratado como sucesso.")
         return
 
-    total = len(settings.targets)
-    if succeeded == total and failed == 0:
-        api.send_message(chat_id, f"Verificação concluída com sucesso para todos os {total} alvos.")
-    else:
-        # Never convert a partial result into a success statement. The counts are the evidence needed to retry/remediate.
-        api.send_message(chat_id, f"Verificação incompleta. Sucesso: {succeeded}. Falhas: {failed}. Total: {total}.")
+    api.send_message(chat_id, f"Verificação concluída com sucesso para todos os {len(settings.targets)} alvos.")
 
 
-def prepare(api: TelegramBotAPI) -> dict:
-    # Startup proves the token identifies a bot and clears the only Telegram mode that conflicts with getUpdates.
-    identity = api.get_me()
+def prepare(api: TelegramBotAPI) -> None:
+    api.get_me()
     api.delete_webhook()
-    return identity
 
 
 def run(api: TelegramBotAPI, settings: Settings) -> None:
@@ -239,8 +238,7 @@ def run(api: TelegramBotAPI, settings: Settings) -> None:
 
     while not _STOP:
         try:
-            updates = api.get_updates(offset)
-            for update in updates:
+            for update in api.get_updates(offset):
                 update_id = update.get("update_id")
                 if not isinstance(update_id, int):
                     raise TelegramAPIError("Update without valid update_id")
@@ -271,9 +269,9 @@ def main() -> None:
     )
     signal.signal(signal.SIGTERM, _stop_handler)
     signal.signal(signal.SIGINT, _stop_handler)
+
     api = TelegramBotAPI(settings.token)
-    identity = prepare(api)
-    LOGGER.info("Telegram bot identity confirmed. Bot ID: %s", identity["id"])
+    prepare(api)
     run(api, settings)
 
 
