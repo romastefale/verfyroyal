@@ -4,6 +4,7 @@ import os
 import signal
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Callable
@@ -163,8 +164,11 @@ class TelegramBotAPI:
             raise TelegramAPIError("getUpdates returned an invalid result")
         return result
 
-    def send_message(self, chat_id: int, text: str) -> None:
-        result = self.call("sendMessage", {"chat_id": chat_id, "text": text})
+    def send_message(self, chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+        payload: dict[str, object] = {"chat_id": chat_id, "text": text}
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        result = self.call("sendMessage", payload)
         if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
             raise TelegramAPIError("sendMessage did not return a valid Message")
 
@@ -241,11 +245,47 @@ def verify_targets(api: TelegramBotAPI, targets: tuple[int, ...]) -> Verificatio
     )
 
 
-def _send(api: TelegramBotAPI, chat_id: int, text: str) -> None:
-    _with_transient_retry(lambda: api.send_message(chat_id, text))
+def _send(api: TelegramBotAPI, chat_id: int, text: str, reply_markup: dict | None = None) -> None:
+    _with_transient_retry(lambda: api.send_message(chat_id, text, reply_markup))
 
 
-def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> None:
+def _private_bot_url(bot_username: str) -> str:
+    return f"https://t.me/{bot_username}?start=verify"
+
+
+def _open_private_keyboard(bot_username: str) -> dict:
+    return {
+        "inline_keyboard": [[
+            {"text": "Abrir conversa com o bot", "url": _private_bot_url(bot_username)}
+        ]]
+    }
+
+
+def _share_instruction_keyboard(bot_username: str) -> dict:
+    bot_url = _private_bot_url(bot_username)
+    text = (
+        "Para concluir sua verificação institucional no Telegram, "
+        "abra o bot pelo link e toque em Iniciar (/start)."
+    )
+    share_url = (
+        "https://t.me/share/url?url="
+        + urllib.parse.quote(bot_url, safe="")
+        + "&text="
+        + urllib.parse.quote(text, safe="")
+    )
+    return {
+        "inline_keyboard": [[
+            {"text": "Enviar instrução ao alvo", "url": share_url}
+        ]]
+    }
+
+
+def handle_message(
+    api: TelegramBotAPI,
+    settings: Settings,
+    message: dict,
+    bot_username: str,
+) -> None:
     text = message.get("text")
     sender = message.get("from") or {}
     chat = message.get("chat") or {}
@@ -255,19 +295,29 @@ def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> No
 
     if not isinstance(text, str) or not isinstance(sender_id, int) or not isinstance(chat_id, int):
         return
-    if chat_type != "private" or chat_id != sender_id:
-        return
 
     command = _command(text)
+
     if command == "/start":
-        if sender_id in settings.targets:
+        if chat_type == "private" and chat_id == sender_id and sender_id in settings.targets:
             _send(api, chat_id, "Conta reconhecida para o fluxo institucional de verificação.")
         return
 
     if command != "/verify":
         return
+
     if sender_id not in settings.owner_ids:
-        _send(api, chat_id, "Ação não autorizada.")
+        if chat_type == "private" and chat_id == sender_id:
+            _send(api, chat_id, "Ação não autorizada.")
+        return
+
+    if chat_type != "private" or chat_id != sender_id:
+        _send(
+            api,
+            chat_id,
+            "Por segurança operacional, a verificação deve ser iniciada na conversa privada com o bot.",
+            _open_private_keyboard(bot_username),
+        )
         return
 
     summary = verify_targets(api, settings.targets)
@@ -277,7 +327,16 @@ def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> No
         return
 
     if summary.permission_missing:
-        _send(api, chat_id, "A capacidade oficial de verificador ainda não está ativa para este bot.")
+        _send(
+            api,
+            chat_id,
+            (
+                "A capacidade oficial de verificador não está ativa para concluir este lote. "
+                f"Verificados antes da interrupção: {summary.succeeded}. "
+                f"Falhas: {summary.failed}. "
+                f"Não tentados: {summary.unattempted}."
+            ),
+        )
         return
 
     parts = [
@@ -285,19 +344,28 @@ def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> No
         f"Sucesso: {summary.succeeded}.",
         f"Falhas: {summary.failed}.",
     ]
+    reply_markup = None
     if summary.inaccessible:
-        parts.append(f"Alvos ainda não acessíveis ao bot: {summary.inaccessible}.")
+        parts.append(
+            f"Alvos ainda não acessíveis ao bot: {summary.inaccessible}. "
+            "Eles precisam abrir a conversa com este bot e enviar /start."
+        )
+        reply_markup = _share_instruction_keyboard(bot_username)
     if summary.unattempted:
         parts.append(f"Não tentados: {summary.unattempted}.")
-    _send(api, chat_id, " ".join(parts))
+    _send(api, chat_id, " ".join(parts), reply_markup)
 
 
-def prepare(api: TelegramBotAPI) -> None:
-    api.get_me()
+def prepare(api: TelegramBotAPI) -> str:
+    identity = api.get_me()
+    username = identity.get("username")
+    if not isinstance(username, str) or not username:
+        raise TelegramAPIError("getMe did not return the bot username required for Telegram links")
     api.delete_webhook()
+    return username
 
 
-def run(api: TelegramBotAPI, settings: Settings) -> None:
+def run(api: TelegramBotAPI, settings: Settings, bot_username: str) -> None:
     offset: int | None = None
     LOGGER.info("Verifier worker started. Configured targets: %d", len(settings.targets))
 
@@ -310,7 +378,7 @@ def run(api: TelegramBotAPI, settings: Settings) -> None:
                 offset = update_id + 1
                 message = update.get("message")
                 if isinstance(message, dict):
-                    handle_message(api, settings, message)
+                    handle_message(api, settings, message, bot_username)
         except TelegramAPIError as exc:
             LOGGER.warning("Telegram API error: %s", exc.description)
             time.sleep(2)
@@ -336,8 +404,8 @@ def main() -> None:
     signal.signal(signal.SIGINT, _stop_handler)
 
     api = TelegramBotAPI(settings.token)
-    prepare(api)
-    run(api, settings)
+    bot_username = prepare(api)
+    run(api, settings, bot_username)
 
 
 if __name__ == "__main__":
