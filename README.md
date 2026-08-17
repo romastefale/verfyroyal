@@ -1,18 +1,20 @@
 # verfyroyal
 
-Bot institucional do Telegram para verificação oficial de contas.
+Bot Telegram para verificação oficial de contas.
 
 ## Comandos
 
-- `/start`
-- `/verifyme`
-- `/verify <user_id>`
+- `/start` — inicia a conversa e mostra o estado atual ao owner
+- `/verifyme` — owner verifica a própria conta
+- `/verify <user_id>` — prepara a verificação de uma conta e pede confirmação
+
+A pessoa alvo precisa ter enviado `/start` neste bot antes da verificação.
 
 ## Variáveis
 
 - `TELEGRAM_BOT_TOKEN`
-- `VERIFICATION_OWNER_IDS`
-- `VERIFICATION_EXECUTIVE_IDS`
+- `VERIFICATION_OWNER_IDS` — exatamente dois IDs de owners, separados por vírgula
+- `VERIFICATION_EXECUTIVE_IDS` — opcional; IDs acompanhados como pendentes
 - `VERIFIER_STATE_PATH` — opcional; padrão `/data/verfyroyal-events.jsonl`
 - `LOG_LEVEL` — opcional; padrão `INFO`
 
@@ -21,5 +23,3 @@ Bot institucional do Telegram para verificação oficial de contas.
 ```bash
 python main.py
 ```
-
-No Railway, o serviço usa a branch `product/final-verifier` e armazenamento persistente montado em `/data`.
