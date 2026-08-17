@@ -6,11 +6,13 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Callable
 
 
 LOGGER = logging.getLogger("verfyroyal")
 _STOP = False
 MAX_TELEGRAM_USER_ID = 0xFFFFFFFFFF
+DEFAULT_ATTEMPTS = 3
 
 
 class TelegramAPIError(RuntimeError):
@@ -31,6 +33,20 @@ class Settings:
     @property
     def targets(self) -> tuple[int, ...]:
         return tuple(dict.fromkeys((*self.owner_ids, *self.executive_ids)))
+
+
+@dataclass(frozen=True)
+class VerificationSummary:
+    total: int
+    succeeded: int
+    failed: int
+    unattempted: int
+    inaccessible: int
+    permission_missing: bool
+
+    @property
+    def complete(self) -> bool:
+        return self.succeeded == self.total and self.failed == 0 and self.unattempted == 0
 
 
 def _parse_ids(raw: str, name: str, required: bool) -> tuple[int, ...]:
@@ -116,11 +132,13 @@ class TelegramBotAPI:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise TelegramAPIError("Telegram returned invalid JSON") from exc
 
-        if not isinstance(body, dict) or body.get("ok") is not True:
+        if not isinstance(body, dict):
+            raise TelegramAPIError("Telegram returned an invalid response")
+        if body.get("ok") is not True:
             raise TelegramAPIError(
-                str(body.get("description", "Telegram API request failed")) if isinstance(body, dict) else "Telegram returned an invalid response",
-                body.get("error_code") if isinstance(body, dict) and isinstance(body.get("error_code"), int) else None,
-                body.get("parameters") if isinstance(body, dict) and isinstance(body.get("parameters"), dict) else {},
+                str(body.get("description", "Telegram API request failed")),
+                body.get("error_code") if isinstance(body.get("error_code"), int) else None,
+                body.get("parameters") if isinstance(body.get("parameters"), dict) else {},
             )
         if "result" not in body:
             raise TelegramAPIError("Telegram success response did not contain result")
@@ -145,12 +163,6 @@ class TelegramBotAPI:
             raise TelegramAPIError("getUpdates returned an invalid result")
         return result
 
-    def get_chat(self, user_id: int) -> dict:
-        result = self.call("getChat", {"chat_id": user_id})
-        if not isinstance(result, dict) or result.get("id") != user_id or result.get("type") != "private":
-            raise TelegramAPIError("getChat did not return the expected private user chat")
-        return result
-
     def send_message(self, chat_id: int, text: str) -> None:
         result = self.call("sendMessage", {"chat_id": chat_id, "text": text})
         if not isinstance(result, dict) or not isinstance(result.get("message_id"), int):
@@ -166,35 +178,71 @@ def _command(text: str) -> str:
     return first.split("@", 1)[0].lower()
 
 
-def _retry_after(exc: TelegramAPIError) -> int | None:
-    if exc.error_code != 429:
-        return None
-    value = exc.parameters.get("retry_after")
-    return value if isinstance(value, int) and value > 0 else 1
+def _is_permission_missing(exc: TelegramAPIError) -> bool:
+    return exc.error_code == 403 and "BOT_VERIFIER_FORBIDDEN" in exc.description.upper()
 
 
-def _call_with_transient_retry(operation, attempts: int = 3) -> None:
+def _is_inaccessible_peer(exc: TelegramAPIError) -> bool:
+    return exc.error_code == 400 and "PEER_ID_INVALID" in exc.description.upper()
+
+
+def _retry_delay(exc: TelegramAPIError, attempt: int) -> int | None:
+    if exc.error_code == 429:
+        retry_after = exc.parameters.get("retry_after")
+        return retry_after if isinstance(retry_after, int) and retry_after > 0 else 1
+    if exc.error_code is None or exc.error_code >= 500:
+        return 2 ** attempt
+    return None
+
+
+def _with_transient_retry(operation: Callable[[], None], attempts: int = DEFAULT_ATTEMPTS) -> None:
+    last_error: TelegramAPIError | None = None
     for attempt in range(attempts):
         try:
             operation()
             return
         except TelegramAPIError as exc:
-            wait = _retry_after(exc)
-            transient = wait is not None or exc.error_code is None or (exc.error_code >= 500 if exc.error_code is not None else False)
-            if not transient or attempt == attempts - 1:
+            last_error = exc
+            delay = _retry_delay(exc, attempt)
+            if delay is None or attempt == attempts - 1:
                 raise
-            time.sleep(wait if wait is not None else 2 ** attempt)
+            time.sleep(delay)
+    if last_error is not None:
+        raise last_error
 
 
-def preflight_targets(api: TelegramBotAPI, targets: tuple[int, ...]) -> None:
+def verify_targets(api: TelegramBotAPI, targets: tuple[int, ...]) -> VerificationSummary:
+    succeeded = 0
+    failed = 0
+    inaccessible = 0
+    permission_missing = False
+    attempted = 0
+
     for user_id in targets:
-        api.get_chat(user_id)
+        attempted += 1
+        try:
+            _with_transient_retry(lambda uid=user_id: api.verify_user(uid))
+            succeeded += 1
+        except TelegramAPIError as exc:
+            failed += 1
+            if _is_permission_missing(exc):
+                permission_missing = True
+                break
+            if _is_inaccessible_peer(exc):
+                inaccessible += 1
+
+    return VerificationSummary(
+        total=len(targets),
+        succeeded=succeeded,
+        failed=failed,
+        unattempted=len(targets) - attempted,
+        inaccessible=inaccessible,
+        permission_missing=permission_missing,
+    )
 
 
-def verify_all(api: TelegramBotAPI, targets: tuple[int, ...]) -> None:
-    preflight_targets(api, targets)
-    for user_id in targets:
-        _call_with_transient_retry(lambda uid=user_id: api.verify_user(uid))
+def _send(api: TelegramBotAPI, chat_id: int, text: str) -> None:
+    _with_transient_retry(lambda: api.send_message(chat_id, text))
 
 
 def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> None:
@@ -206,25 +254,39 @@ def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> No
 
     if not isinstance(text, str) or not isinstance(sender_id, int) or not isinstance(chat_id, int):
         return
-    if _command(text) != "/verify":
+
+    command = _command(text)
+    if command == "/start":
+        if sender_id in settings.targets:
+            _send(api, chat_id, "Conta reconhecida para o fluxo institucional de verificação.")
+        return
+
+    if command != "/verify":
         return
     if sender_id not in settings.owner_ids:
-        api.send_message(chat_id, "Ação não autorizada.")
+        _send(api, chat_id, "Ação não autorizada.")
         return
 
-    try:
-        verify_all(api, settings.targets)
-    except TelegramAPIError as exc:
-        if exc.error_code == 403 and "BOT_VERIFIER_FORBIDDEN" in exc.description.upper():
-            api.send_message(chat_id, "A capacidade oficial de verificador ainda não está ativa para este bot.")
-            return
-        if exc.error_code == 400 and "PEER_ID_INVALID" in exc.description.upper():
-            api.send_message(chat_id, "Um ou mais alvos ainda não estão acessíveis ao bot no Telegram.")
-            return
-        api.send_message(chat_id, "A verificação não foi concluída. Nenhum resultado foi tratado como sucesso.")
+    summary = verify_targets(api, settings.targets)
+
+    if summary.complete:
+        _send(api, chat_id, f"Verificação concluída com sucesso para todos os {summary.total} alvos.")
         return
 
-    api.send_message(chat_id, f"Verificação concluída com sucesso para todos os {len(settings.targets)} alvos.")
+    if summary.permission_missing:
+        _send(api, chat_id, "A capacidade oficial de verificador ainda não está ativa para este bot.")
+        return
+
+    parts = [
+        "Verificação incompleta.",
+        f"Sucesso: {summary.succeeded}.",
+        f"Falhas: {summary.failed}.",
+    ]
+    if summary.inaccessible:
+        parts.append(f"Alvos ainda não acessíveis ao bot: {summary.inaccessible}.")
+    if summary.unattempted:
+        parts.append(f"Não tentados: {summary.unattempted}.")
+    _send(api, chat_id, " ".join(parts))
 
 
 def prepare(api: TelegramBotAPI) -> None:
