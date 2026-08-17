@@ -1,0 +1,27 @@
+# Operational invariants
+
+This service intentionally fails closed. A green process is not treated as proof that verification happened.
+
+## What counts as success
+
+A verification is reported as success only when the Bot API `verifyUser` call returns the literal value `true`.
+
+On the `main` branch, a `/verify` execution is reported as total success only when every configured unique target returns `true`. Any `false`, protocol error, network error, malformed response or failed retry produces an incomplete result with explicit success/failure counts.
+
+On the `product/` branches, verification is unit-based. Success is recorded in the persistent store only after `verifyUser` returns `true`. Failed attempts (except capability-missing) leave no durable record.
+
+## Failures that are expected and verifiable
+
+- `BOT_VERIFIER_FORBIDDEN` (403): the bot does not currently have Telegram's verifier capability. This is never converted into a product success. On `main` it stops the batch; on `product/` it is recorded as `capability_missing`. Remedy: confirm the verifier authorization on the Telegram side, then retry the same deployed code.
+- `429 Too Many Requests`: the service uses Telegram's `retry_after` once for the affected target. A second failure remains a failure and is reported as such.
+- Invalid token / invalid bot identity: startup stops during `getMe`. Remedy: correct `TELEGRAM_BOT_TOKEN` in Railway.
+- Existing webhook: startup calls `deleteWebhook` with `drop_pending_updates=false` because this product deliberately uses `getUpdates`; Telegram documents these update modes as mutually exclusive. The call must return `true`.
+- Invalid or missing target configuration: startup fails before contacting users. Remedy: correct `VERIFICATION_OWNER_IDS` / `VERIFICATION_EXECUTIVE_IDS`.
+- Partial target failure (`main` only): the operator receives `Verificação incompleta` with success/failure counts. Remedy: inspect Telegram/runtime logs and retry only after the underlying cause is resolved.
+- Transient or rejection failures (`product/` only): reported to the operator with a classified message, but not written to the persistent store. Only successful verifications and capability-missing events are retained.
+
+## Why these checks exist
+
+The dangerous failure mode for this product is not a visible exception; it is a false success. For that reason, `verifyUser` is accepted only on literal `true`, response shapes are validated (more strictly on `main`), and success is never inferred from the absence of an error.
+
+The implementation prioritizes preventing false success over complete durable evidence of every failed attempt. On the delivered `product/` line, the operator sees mainly successes and selected error messages; the full history of failed tries is not retained.
