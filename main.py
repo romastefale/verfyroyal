@@ -163,6 +163,9 @@ class EventStore:
     def record_capability_missing(self, actor_id: int) -> None:
         self.append({"type": "capability_missing", "actor_id": actor_id})
 
+    def record_interaction(self, user_id: int, kind: str) -> None:
+        self.append({"type": "interaction", "user_id": user_id, "kind": kind})
+
 
 # Pure diagnostic reducers: they inspect evidence but never call Telegram or mutate state.
 def capability_from_events(events: tuple[dict, ...]) -> CapabilityState:
@@ -183,6 +186,28 @@ def verified_ids_from_events(events: tuple[dict, ...]) -> tuple[int, ...]:
         subject_id = event.get("subject_id")
         if isinstance(subject_id, int) and 1 <= subject_id <= MAX_TELEGRAM_USER_ID:
             ids.append(subject_id)
+    return tuple(dict.fromkeys(ids))
+
+
+def interacted_ids_from_events(events: tuple[dict, ...]) -> tuple[int, ...]:
+    ids: list[int] = []
+    for event in events:
+        if event.get("type") != "interaction":
+            continue
+        user_id = event.get("user_id")
+        if isinstance(user_id, int) and 1 <= user_id <= MAX_TELEGRAM_USER_ID:
+            ids.append(user_id)
+    return tuple(dict.fromkeys(ids))
+
+
+def started_ids_from_events(events: tuple[dict, ...]) -> tuple[int, ...]:
+    ids: list[int] = []
+    for event in events:
+        if event.get("type") != "interaction" or event.get("kind") != "start":
+            continue
+        user_id = event.get("user_id")
+        if isinstance(user_id, int) and 1 <= user_id <= MAX_TELEGRAM_USER_ID:
+            ids.append(user_id)
     return tuple(dict.fromkeys(ids))
 
 
@@ -379,7 +404,9 @@ def _display_name(chat: dict) -> tuple[str, str | None] | None:
 
 
 def build_inventory(api: TelegramBotAPI, store: EventStore, settings: Settings) -> Inventory:
-    verified_ids = verified_ids_from_events(store.read_events())
+    events = store.read_events()
+    interacted = set(interacted_ids_from_events(events))
+    verified_ids = tuple(user_id for user_id in verified_ids_from_events(events) if user_id in interacted)
     resolved: list[ResolvedUser] = []
     unresolved = 0
     for user_id in verified_ids:
@@ -596,6 +623,16 @@ def prepare_third_party_confirmation(
         _send_error(api, chat_id, "invalid_target_id", "Use /verify <user_id> com um único ID válido.")
         return
 
+    if target_id not in started_ids_from_events(store.read_events()):
+        _send_error(
+            api,
+            chat_id,
+            "target_inaccessible",
+            "O alvo precisa abrir a conversa com o bot e enviar /start antes da verificação.",
+            _share_instruction_keyboard(bot_username),
+        )
+        return
+
     resolution, chat = _resolution_state(api, target_id)
     if resolution == "inaccessible":
         _send_error(
@@ -651,6 +688,16 @@ def execute_confirmed_third_party(
         _send_error(api, chat_id, "owner_not_verified", "O owner não está registrado como verificado.")
         return
 
+    if target_id not in started_ids_from_events(store.read_events()):
+        _send_error(
+            api,
+            chat_id,
+            "target_inaccessible",
+            "O alvo precisa abrir a conversa com o bot e enviar /start antes da verificação.",
+            _share_instruction_keyboard(bot_username),
+        )
+        return
+
     resolution, _ = _resolution_state(api, target_id)
     if resolution == "inaccessible":
         _send_error(
@@ -701,6 +748,7 @@ def handle_message(
 
     if sender_id not in settings.owner_ids:
         if command == "/start" and _is_private_1to1(message):
+            store.record_interaction(sender_id, "start")
             _send(api, chat_id, "Conversa iniciada. Nenhuma verificação foi aplicada.")
         else:
             _send_error(api, chat_id, "unauthorized_sender", "Somente owners autorizam verificações.")
@@ -717,11 +765,14 @@ def handle_message(
         return
 
     if command == "/start":
+        store.record_interaction(sender_id, "start")
         _render_owner_start(api, store, settings, sender_id, chat_id)
         return
     if command == "/verifyme":
+        store.record_interaction(sender_id, "owner_self")
         execute_owner_self_verification(api, store, sender_id, chat_id)
         return
+    store.record_interaction(sender_id, "owner_verify")
     prepare_third_party_confirmation(api, store, settings, sender_id, chat_id, argument, bot_username)
 
 
