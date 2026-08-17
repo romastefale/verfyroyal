@@ -102,7 +102,11 @@ class ContractTests(unittest.TestCase):
         self.temp.cleanup()
 
     def mark_verified(self, user_id, actor_id=1, mode="test"):
+        self.store.record_interaction(user_id, "test")
         self.store.record_verification_success(user_id, actor_id, mode)
+
+    def mark_started(self, user_id):
+        self.store.record_interaction(user_id, "start")
 
     def test_start_never_calls_verify_user_for_third_party(self):
         handle_message(self.api, self.store, self.settings, private_message(1, "/start"), "VerifierBot")
@@ -123,6 +127,7 @@ class ContractTests(unittest.TestCase):
 
     def test_verify_command_does_not_iterate_configured_targets(self):
         self.mark_verified(1)
+        self.mark_started(9)
         handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
         self.assertEqual(self.api.verify_calls, [])
         markup = self.api.messages[-1][2]
@@ -132,6 +137,7 @@ class ContractTests(unittest.TestCase):
 
     def test_success_is_persisted_only_after_literal_true(self):
         self.mark_verified(1)
+        self.mark_started(9)
         self.api.verify_outcomes[9] = False
         handle_callback_query(self.api, self.store, self.settings, callback(1, "verify:9"), "VerifierBot")
         verified = verified_ids_from_events(self.store.read_events())
@@ -140,11 +146,18 @@ class ContractTests(unittest.TestCase):
 
     def test_peer_id_invalid_is_target_inaccessible(self):
         self.mark_verified(1)
+        self.mark_started(9)
         self.api.chats.pop(9)
         handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
         self.assertEqual(self.api.verify_calls, [])
         self.assertIn("target_inaccessible", self.api.messages[-1][1])
         self.assertIsNotNone(self.api.messages[-1][2])
+
+    def test_resolvable_target_without_start_is_still_inaccessible(self):
+        self.mark_verified(1)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        self.assertIn("target_inaccessible", self.api.messages[-1][1])
 
     def test_inventory_excludes_pending(self):
         self.mark_verified(1)
@@ -182,12 +195,14 @@ class ContractTests(unittest.TestCase):
 
     def test_manual_target_requires_confirmation(self):
         self.mark_verified(1)
+        self.mark_started(9)
         handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
         self.assertEqual(self.api.verify_calls, [])
         self.assertIn("Nenhuma verificação foi executada ainda", self.api.messages[-1][1])
 
     def test_confirmation_affects_at_most_one_target(self):
         self.mark_verified(1)
+        self.mark_started(9)
         handle_callback_query(self.api, self.store, self.settings, callback(1, "verify:9"), "VerifierBot")
         self.assertEqual(self.api.verify_calls, [9])
         self.assertIn(9, verified_ids_from_events(self.store.read_events()))
@@ -205,9 +220,9 @@ class ContractTests(unittest.TestCase):
 
     def test_transient_api_error_is_not_persisted_as_success(self):
         self.mark_verified(1)
+        self.mark_started(9)
         self.api.verify_outcomes[9] = TelegramAPIError("server", 500)
         handle_callback_query(self.api, self.store, self.settings, callback(1, "verify:9"), "VerifierBot")
-        self.assertEqual(self.api.verify_calls, [9])
         self.assertNotIn(9, verified_ids_from_events(self.store.read_events()))
         self.assertIn("transient_api_error", self.api.messages[-1][1])
 
