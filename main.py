@@ -251,8 +251,11 @@ def handle_message(api: TelegramBotAPI, settings: Settings, message: dict) -> No
     chat = message.get("chat") or {}
     sender_id = sender.get("id")
     chat_id = chat.get("id")
+    chat_type = chat.get("type")
 
     if not isinstance(text, str) or not isinstance(sender_id, int) or not isinstance(chat_id, int):
+        return
+    if chat_type != "private" or chat_id != sender_id:
         return
 
     command = _command(text)
