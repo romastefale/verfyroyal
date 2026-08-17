@@ -30,6 +30,7 @@ class Settings:
     executives: tuple[int, ...]
     state_path: str
     log_level: str = "INFO"
+    roles_enabled: bool = False
 
     @property
     def configured(self) -> tuple[int, ...]:
@@ -66,6 +67,7 @@ def load_settings(env=None) -> Settings:
         parse_ids(env.get("VERIFICATION_EXECUTIVE_IDS", "")),
         env.get("VERIFIER_STATE_PATH", "/data/verfyroyal-events.jsonl").strip() or "/data/verfyroyal-events.jsonl",
         env.get("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        env.get("VERIFICATION_ROLES_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"},
     )
 
 
@@ -189,6 +191,12 @@ class Telegram:
             raise TelegramError("verifyUser did not return True", 400)
         return True
 
+    def role(self, user_id: int, description: str):
+        result = self.call("verifyUser", {"user_id": user_id, "custom_description": description})
+        if result is not True:
+            raise TelegramError("verifyUser did not return True", 400)
+        return True
+
 
 def classify(exc: TelegramError) -> str:
     text = exc.text.upper()
@@ -219,6 +227,16 @@ def user_id(text: str):
     except ValueError:
         return None
     return value if 1 <= value <= MAX_ID else None
+
+
+def role_args(text: str):
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return None, None
+    target, description = user_id(parts[0]), parts[1].strip()
+    if target is None or not 1 <= len(description) <= 70:
+        return None, None
+    return target, description
 
 
 def error(api, chat_id, kind, text, markup=None):
@@ -346,13 +364,37 @@ def verify_target(api, store, settings, owner_id, target, bot_username):
     api.send(owner_id, f"Conta {target} verificada com sucesso.")
 
 
+def set_role(api, store, settings, owner_id, raw):
+    if not settings.roles_enabled:
+        error(api, owner_id, "role_unavailable", "Cargos personalizados não estão habilitados.")
+        return
+    verified = event_ids(store.read(), "verified")
+    if owner_id not in verified:
+        error(api, owner_id, "owner_not_verified", "Sua conta de owner não está verificada.")
+        return
+    target, description = role_args(raw)
+    if target is None:
+        error(api, owner_id, "invalid_role", "Use /role <user_id> <cargo> com até 70 caracteres.")
+        return
+    if target not in verified:
+        error(api, owner_id, "target_not_verified", "A conta precisa estar verificada antes de receber um cargo.")
+        return
+    try:
+        api.role(target, description)
+    except TelegramError as exc:
+        kind = classify(exc)
+        error(api, owner_id, "role_unavailable" if kind == "verification_rejected" else kind, "O cargo não foi aplicado.")
+        return
+    api.send(owner_id, f"Cargo aplicado à conta {target}: {description}")
+
+
 def handle_message(api, store, settings, message, bot_username):
     text, sender, chat = message.get("text"), message.get("from") or {}, message.get("chat") or {}
     sender_id, chat_id = sender.get("id"), chat.get("id")
     if not isinstance(text, str) or not isinstance(sender_id, int) or not isinstance(chat_id, int):
         return
     cmd, arg = command(text)
-    if cmd not in {"/start", "/verifyme", "/verify"}:
+    if cmd not in {"/start", "/verifyme", "/verify", "/role"}:
         return
     if cmd == "/start" and private(message):
         if sender_id not in event_ids(store.read(), "start"):
@@ -365,7 +407,12 @@ def handle_message(api, store, settings, message, bot_username):
     if not private(message):
         error(api, chat_id, "non_private_chat", "Abra a conversa privada com o bot.")
         return
-    verify_owner(api, store, sender_id) if cmd == "/verifyme" else prepare_target(api, store, settings, sender_id, arg, bot_username)
+    if cmd == "/verifyme":
+        verify_owner(api, store, sender_id)
+    elif cmd == "/verify":
+        prepare_target(api, store, settings, sender_id, arg, bot_username)
+    else:
+        set_role(api, store, settings, sender_id, arg)
 
 
 def handle_callback(api, store, settings, query, bot_username):
