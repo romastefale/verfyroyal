@@ -129,21 +129,28 @@ class ProductTests(unittest.TestCase):
     def test_non_owner_cannot_trigger(self):
         api = ScriptedAPI()
         settings = Settings("token", (1, 2), (3,))
-        handle_message(api, settings, {"text": "/verify", "from": {"id": 99}, "chat": {"id": 99}})
+        handle_message(api, settings, {"text": "/verify", "from": {"id": 99}, "chat": {"id": 99, "type": "private"}})
         self.assertEqual(api.verified, [])
         self.assertEqual(api.messages[-1][1], "Ação não autorizada.")
+
+    def test_verification_command_is_ignored_outside_private_chat(self):
+        api = ScriptedAPI()
+        settings = Settings("token", (1, 2), (3,))
+        handle_message(api, settings, {"text": "/verify", "from": {"id": 1}, "chat": {"id": -100123, "type": "supergroup"}})
+        self.assertEqual(api.verified, [])
+        self.assertEqual(api.messages, [])
 
     def test_owner_only_gets_success_after_all_targets_succeed(self):
         api = ScriptedAPI()
         settings = Settings("token", (1, 2), (3,))
-        handle_message(api, settings, {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1}})
+        handle_message(api, settings, {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1, "type": "private"}})
         self.assertEqual(api.verified, [1, 2, 3])
         self.assertEqual(api.messages[-1][1], "Verificação concluída com sucesso para todos os 3 alvos.")
 
     def test_partial_result_message_is_truthful(self):
         api = ScriptedAPI({2: [TelegramAPIError("Bad Request: PEER_ID_INVALID", 400)]})
         settings = Settings("token", (1, 2), (3,))
-        handle_message(api, settings, {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1}})
+        handle_message(api, settings, {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1, "type": "private"}})
         message = api.messages[-1][1]
         self.assertIn("Verificação incompleta", message)
         self.assertIn("Sucesso: 2", message)
@@ -153,9 +160,9 @@ class ProductTests(unittest.TestCase):
     def test_start_is_only_acknowledged_for_configured_targets(self):
         api = ScriptedAPI()
         settings = Settings("token", (1, 2), (3,))
-        handle_message(api, settings, {"text": "/start", "from": {"id": 3}, "chat": {"id": 3}})
+        handle_message(api, settings, {"text": "/start", "from": {"id": 3}, "chat": {"id": 3, "type": "private"}})
         self.assertEqual(len(api.messages), 1)
-        handle_message(api, settings, {"text": "/start", "from": {"id": 99}, "chat": {"id": 99}})
+        handle_message(api, settings, {"text": "/start", "from": {"id": 99}, "chat": {"id": 99, "type": "private"}})
         self.assertEqual(len(api.messages), 1)
 
     def test_invalid_json_and_missing_result_fail_closed(self):
