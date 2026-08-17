@@ -13,18 +13,15 @@ Nenhum token ou ID real é armazenado no repositório.
 
 ## Funcionamento
 
-O serviço usa long polling da Bot API oficial. Ao iniciar, confirma o token com `getMe` e remove eventual webhook anterior para deixar `getUpdates` como único modo de recebimento de updates.
+O serviço usa a Bot API oficial do Telegram por long polling. Ao iniciar, valida o token com `getMe` e remove eventual webhook anterior para usar `getUpdates` como único modo de recebimento de updates.
 
-Antes de verificar qualquer pessoa, o bot confirma com `getChat` que todos os owners e executivos configurados estão acessíveis como usuários privados. Para garantir isso, cada alvo deve ter aberto uma conversa com o bot (por exemplo, enviando `/start`) antes da primeira execução de `/verify`.
+Os owners e executivos configurados podem enviar `/start` ao bot para estabelecer o contato direto necessário quando o Telegram ainda não reconhecer o usuário como um peer acessível ao bot.
 
-Quando um dos dois owners envia `/verify`, o bot:
+Quando um dos dois owners envia `/verify`, o serviço chama o método oficial `verifyUser` para cada owner e executivo único. Cada alvo é tratado individualmente, erros transitórios recebem novas tentativas limitadas e somente o retorno literal `True` é considerado sucesso. O bot só declara sucesso total quando todos os alvos tiverem sido verificados com sucesso.
 
-1. valida todos os alvos antes de modificar qualquer verificação;
-2. chama o método oficial `verifyUser` para cada owner e executivo único;
-3. trata apenas o retorno literal `True` da Bot API como sucesso;
-4. só declara sucesso quando todos os alvos foram processados com sucesso.
+Se o Telegram responder `PEER_ID_INVALID` para algum alvo, esse alvo permanece explicitamente como falha e pode enviar `/start` ao bot antes de uma nova tentativa. Se a capacidade de verificador ainda não estiver habilitada, `BOT_VERIFIER_FORBIDDEN` interrompe a execução sem ser tratado como sucesso.
 
-O bot não envia `custom_description`. Assim, utiliza a descrição padrão configurada pelo Telegram para a organização verificadora e não depende da permissão opcional de descrição individual.
+O bot não envia `custom_description`; portanto, usa a descrição padrão definida para a organização verificadora e não depende da permissão opcional de descrição individual.
 
 ## Execução local
 
@@ -40,4 +37,4 @@ python -m unittest discover -s tests -v
 
 ## Railway
 
-O repositório inclui `Dockerfile` e `railway.toml`. A branch de entrega atual é `product/final-verifier`. Configure as três variáveis reais no serviço Railway antes do primeiro deploy dessa branch.
+O repositório inclui `Dockerfile` e `railway.toml`. A branch de entrega é `product/final-verifier`. Configure as variáveis reais no serviço Railway antes do primeiro deploy dessa branch.
