@@ -1,27 +1,27 @@
 # Operational invariants
 
-This service fails closed. A running process is not proof that verification happened.
+This service is designed to avoid reporting success when verification did not fully occur. A running process by itself is not considered sufficient evidence that verification succeeded.
 
 ## What counts as success
 
-Success exists only when `verifyUser` returns the literal boolean `true`.
+A verification is treated as successful only when the Bot API `verifyUser` method returns the literal value `true`.
 
-On `main`, total success is reported only when every configured target returns `true` and failures equal zero. Any other outcome produces “Verificação incompleta” with counts.
+On the `main` branch, a `/verify` command is reported as fully successful only when every configured target returns `true`. If any target fails, the operator receives an incomplete result together with the counts of successes and failures.
 
-On `product/`, verification is unit-based. A `"verified"` record is written only after `true`. Failed attempts (except capability-missing) leave no durable record. The owner inventory shows only successes.
+On the `product/` branches, verification is performed one target at a time. A successful result is recorded only after `verifyUser` returns `true`. Other outcomes are reported to the operator but are not stored as verified records.
 
 ## Failures that are expected and verifiable
 
-- `BOT_VERIFIER_FORBIDDEN` (403): never treated as success. On `main` stops the batch; on `product/` recorded as `capability_missing`. Remedy: enable verifier capability on Telegram, then retry.
-- `429 Too Many Requests`: one retry using `retry_after`. Second failure remains failure.
-- Invalid token or bot identity: startup aborts on `getMe`. Remedy: fix `TELEGRAM_BOT_TOKEN`.
-- Existing webhook: startup calls `deleteWebhook` (`drop_pending_updates=false`) and requires `true`.
-- Invalid target configuration: startup aborts. Exactly two distinct owner IDs required.
-- Partial failure (`main`): operator receives incomplete result with counts.
-- Transient/rejection failures (`product/`): operator receives classified message; nothing is persisted except successes and capability-missing.
+- `BOT_VERIFIER_FORBIDDEN` (403): the bot does not yet have verifier capability. This is reported clearly and is not treated as success. Remedy: obtain the capability on the Telegram side and retry.
+- `429 Too Many Requests`: the service respects `retry_after` once. A further failure is reported as failure.
+- Invalid token or bot identity: startup stops at `getMe`. Remedy: correct `TELEGRAM_BOT_TOKEN`.
+- Existing webhook: startup removes it with `deleteWebhook` so that `getUpdates` can be used cleanly.
+- Invalid or incomplete target configuration: startup stops before any user is contacted. Exactly two distinct owner IDs are required.
+- Partial failure on `main`: the operator is informed with success and failure counts.
+- Other failures on `product/`: the operator receives a clear message; only confirmed successes are kept in the store.
 
 ## Why these checks exist
 
-The dangerous failure mode is false success. Therefore `verifyUser` is accepted only on literal `true` and success is never inferred from the absence of an error.
+The main risk is reporting success when verification did not actually complete. The checks above exist to keep that distinction clear.
 
-The code prioritises preventing false success over keeping a full durable history of failures. On the delivered `product/` line the operator mostly sees successes. A green process remains insufficient proof.
+The service focuses on not claiming success incorrectly. On the `product/` line, the record kept for the operator emphasises confirmed successes.
