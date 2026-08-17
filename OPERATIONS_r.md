@@ -25,11 +25,3 @@ On the `product/` branches, verification is unit-based (one target at a time, wi
 The dangerous failure mode for this product is not a visible exception; it is a false success. For that reason, `verifyUser` is accepted only on literal `true`, response shapes are validated (more strictly on `main`), and success is never inferred from the mere absence of an error.
 
 The implementation prioritises preventing false success over complete durable evidence of every failed attempt. On the delivered `product/` line the operator sees mainly successes and selected error messages; the full history of failed tries is not retained. The process itself continues running after most protocol errors, so a green process remains insufficient proof that verification occurred.
-
-## Nota sobre a forma deste documento
-
-O contrato acima descreve o que o código realmente faz.  
-A versão original do `OPERATIONS.md` e a sequência de endurecimentos que o acompanharam foram moldadas, em parte, pela necessidade de deixar explícita a recusa a falso sucesso. Essa ênfase não era estritamente necessária para o funcionamento do produto; ela surgiu durante o processo de construção, quando o rigor passou a ser tratado também como postura diante de possível escrutínio.
-
-O texto operacional que fica é o das seções anteriores.  
-Esta nota serve apenas para registrar, com clareza, que a forma final do documento carregou uma preocupação adicional à entrega do comportamento em si.
