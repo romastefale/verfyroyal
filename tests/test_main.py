@@ -1,25 +1,23 @@
 import io
 import json
+import tempfile
 import unittest
 import urllib.error
-import urllib.parse
+from pathlib import Path
 from unittest.mock import patch
 
 from main import (
-    MAX_TELEGRAM_USER_ID,
+    EventStore,
     Settings,
     TelegramAPIError,
     TelegramBotAPI,
-    VerificationSummary,
-    _with_transient_retry,
+    build_inventory,
+    capability_from_events,
+    handle_callback_query,
     handle_message,
     load_settings,
-    prepare,
-    verify_targets,
+    verified_ids_from_events,
 )
-
-
-BOT_USERNAME = "VerifierBot"
 
 
 class Response:
@@ -37,76 +35,197 @@ class Response:
 
 
 class ScriptedAPI:
-    def __init__(self, outcomes=None):
-        self.outcomes = {key: list(value) for key, value in (outcomes or {}).items()}
-        self.verified = []
+    def __init__(self):
+        self.verify_calls = []
         self.messages = []
-        self.get_me_result = {"id": 777, "is_bot": True, "username": BOT_USERNAME}
-        self.webhook_deleted = False
+        self.callbacks = []
+        self.chats = {}
+        self.verify_outcomes = {}
+
+    def get_chat(self, user_id):
+        result = self.chats.get(user_id)
+        if isinstance(result, Exception):
+            raise result
+        if result is None:
+            raise TelegramAPIError("Bad Request: PEER_ID_INVALID", 400)
+        return result
 
     def verify_user(self, user_id):
-        self.verified.append(user_id)
-        queue = self.outcomes.get(user_id, [])
-        if queue:
-            outcome = queue.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            if outcome is not True:
-                raise TelegramAPIError("verifyUser did not return True")
+        self.verify_calls.append(user_id)
+        outcome = self.verify_outcomes.get(user_id, True)
+        if isinstance(outcome, list):
+            outcome = outcome.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        if outcome is not True:
+            raise TelegramAPIError("verifyUser did not return True", 400)
+        return True
 
     def send_message(self, chat_id, text, reply_markup=None):
         self.messages.append((chat_id, text, reply_markup))
 
-    def get_me(self):
-        return self.get_me_result
-
-    def delete_webhook(self):
-        self.webhook_deleted = True
+    def answer_callback_query(self, query_id, text=None):
+        self.callbacks.append((query_id, text))
 
 
-class ProductTests(unittest.TestCase):
-    def test_configuration_is_exact_and_ids_are_valid(self):
-        settings = load_settings({
-            "TELEGRAM_BOT_TOKEN": "token",
-            "VERIFICATION_OWNER_IDS": "1,2",
-            "VERIFICATION_EXECUTIVE_IDS": "2,3,3",
-        })
-        self.assertEqual(settings.owner_ids, (1, 2))
-        self.assertEqual(settings.targets, (1, 2, 3))
-        with self.assertRaises(ValueError):
-            load_settings({"TELEGRAM_BOT_TOKEN": "token", "VERIFICATION_OWNER_IDS": "1"})
-        with self.assertRaises(ValueError):
-            load_settings({
-                "TELEGRAM_BOT_TOKEN": "token",
-                "VERIFICATION_OWNER_IDS": f"1,{MAX_TELEGRAM_USER_ID + 1}",
-            })
+def private_message(sender_id, text):
+    return {"text": text, "from": {"id": sender_id}, "chat": {"id": sender_id, "type": "private"}}
 
-    def test_verify_user_calls_official_method_with_exact_payload(self):
-        api = TelegramBotAPI("secret")
-        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": True})) as urlopen:
-            api.verify_user(123456789)
-        request = urlopen.call_args.args[0]
-        self.assertTrue(request.full_url.endswith("/verifyUser"))
-        self.assertEqual(json.loads(request.data), {"user_id": 123456789})
 
+def callback(sender_id, data):
+    return {
+        "id": "cb1",
+        "data": data,
+        "from": {"id": sender_id},
+        "message": {"chat": {"id": sender_id, "type": "private"}},
+    }
+
+
+class ContractTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.temp.name) / "events.jsonl")
+        self.store = EventStore(self.path)
+        self.settings = Settings("token", (1, 2), (3, 4), self.path)
+        self.api = ScriptedAPI()
+        for uid, name in [(1, "Owner One"), (2, "Owner Two"), (3, "Exec Three"), (4, "Exec Four"), (9, "Target Nine")]:
+            first, *rest = name.split()
+            self.api.chats[uid] = {
+                "id": uid,
+                "type": "private",
+                "first_name": first,
+                "last_name": " ".join(rest),
+                "username": f"user{uid}",
+            }
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def mark_verified(self, user_id, actor_id=1, mode="test"):
+        self.store.record_verification_success(user_id, actor_id, mode)
+
+    def test_start_never_calls_verify_user_for_third_party(self):
+        handle_message(self.api, self.store, self.settings, private_message(1, "/start"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+
+    def test_capability_missing_blocks_third_party_verification(self):
+        self.mark_verified(1)
+        self.store.record_capability_missing(1)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        self.assertIn("capability_missing", self.api.messages[-1][1])
+
+    def test_owner_unverified_blocks_verify(self):
+        self.mark_verified(2, actor_id=2, mode="owner_self")
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        self.assertIn("owner_not_verified", self.api.messages[-1][1])
+
+    def test_verify_command_does_not_iterate_configured_targets(self):
+        self.mark_verified(1)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        markup = self.api.messages[-1][2]
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "verify:9")
+        handle_callback_query(self.api, self.store, self.settings, callback(1, "verify:9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [9])
+
+    def test_success_is_persisted_only_after_literal_true(self):
+        self.mark_verified(1)
+        self.api.verify_outcomes[9] = False
+        handle_callback_query(self.api, self.store, self.settings, callback(1, "verify:9"), "VerifierBot")
+        verified = verified_ids_from_events(self.store.read_events())
+        self.assertNotIn(9, verified)
+        self.assertIn("verification_rejected", self.api.messages[-1][1])
+
+    def test_peer_id_invalid_is_target_inaccessible(self):
+        self.mark_verified(1)
+        self.api.chats.pop(9)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        self.assertIn("target_inaccessible", self.api.messages[-1][1])
+        self.assertIsNotNone(self.api.messages[-1][2])
+
+    def test_inventory_excludes_pending(self):
+        self.mark_verified(1)
+        inventory = build_inventory(self.api, self.store, self.settings)
+        self.assertEqual([item.user_id for item in inventory.verified], [1])
+        self.assertEqual(inventory.pending_count, 3)
+
+    def test_non_owner_cannot_authorize_verification(self):
+        self.api.chats[99] = {"id": 99, "type": "private", "first_name": "No", "last_name": "Owner"}
+        handle_message(self.api, self.store, self.settings, private_message(99, "/verify 9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        self.assertIn("unauthorized_sender", self.api.messages[-1][1])
+
+    def test_owner_self_verification_only_verifies_sender(self):
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verifyme"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [1])
+        self.assertIn(1, verified_ids_from_events(self.store.read_events()))
+        self.assertEqual(capability_from_events(self.store.read_events()), "active")
+
+    def test_owner_self_failure_does_not_persist_verified(self):
+        self.api.verify_outcomes[1] = TelegramAPIError("Forbidden: BOT_VERIFIER_FORBIDDEN", 403)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verifyme"), "VerifierBot")
+        self.assertNotIn(1, verified_ids_from_events(self.store.read_events()))
+        self.assertEqual(capability_from_events(self.store.read_events()), "missing")
+
+    def test_start_state_c_inventory_uses_success_records(self):
+        self.mark_verified(1)
+        self.mark_verified(9)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/start"), "VerifierBot")
+        message = self.api.messages[-1][1]
+        self.assertIn("Estado C", message)
+        self.assertIn("Owner One", message)
+        self.assertIn("Target Nine", message)
+        self.assertIn("Pendentes configurados: 3", message)
+
+    def test_manual_target_requires_confirmation(self):
+        self.mark_verified(1)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verify 9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        self.assertIn("Nenhuma verificação foi executada ainda", self.api.messages[-1][1])
+
+    def test_confirmation_affects_at_most_one_target(self):
+        self.mark_verified(1)
+        handle_callback_query(self.api, self.store, self.settings, callback(1, "verify:9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [9])
+        self.assertIn(9, verified_ids_from_events(self.store.read_events()))
+
+    def test_non_private_chat_is_explicitly_rejected(self):
+        message = {"text": "/verify 9", "from": {"id": 1}, "chat": {"id": -100, "type": "supergroup"}}
+        handle_message(self.api, self.store, self.settings, message, "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [])
+        self.assertIn("non_private_chat", self.api.messages[-1][1])
+
+    def test_invalid_target_id_is_explicit(self):
+        self.mark_verified(1)
+        handle_message(self.api, self.store, self.settings, private_message(1, "/verify abc"), "VerifierBot")
+        self.assertIn("invalid_target_id", self.api.messages[-1][1])
+
+    def test_transient_api_error_is_not_persisted_as_success(self):
+        self.mark_verified(1)
+        self.api.verify_outcomes[9] = TelegramAPIError("server", 500)
+        handle_callback_query(self.api, self.store, self.settings, callback(1, "verify:9"), "VerifierBot")
+        self.assertEqual(self.api.verify_calls, [9])
+        self.assertNotIn(9, verified_ids_from_events(self.store.read_events()))
+        self.assertIn("transient_api_error", self.api.messages[-1][1])
+
+
+class TransportContractTests(unittest.TestCase):
     def test_verify_user_requires_literal_true(self):
         api = TelegramBotAPI("secret")
+        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": True})) as urlopen:
+            self.assertTrue(api.verify_user(123))
+        request = urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/verifyUser"))
+        self.assertEqual(json.loads(request.data), {"user_id": 123})
+
         with patch("main.urllib.request.urlopen", return_value=Response({"ok": True, "result": False})):
             with self.assertRaises(TelegramAPIError):
-                api.verify_user(1)
+                api.verify_user(123)
 
-    def test_send_message_passes_inline_keyboard_to_telegram(self):
-        api = TelegramBotAPI("secret")
-        markup = {"inline_keyboard": [[{"text": "Abrir", "url": "https://t.me/TestBot"}]]}
-        with patch(
-            "main.urllib.request.urlopen",
-            return_value=Response({"ok": True, "result": {"message_id": 1}}),
-        ) as urlopen:
-            api.send_message(55, "texto", markup)
-        payload = json.loads(urlopen.call_args.args[0].data)
-        self.assertEqual(payload["reply_markup"], markup)
-
-    def test_http_error_preserves_telegram_permission_error(self):
+    def test_http_permission_error_preserves_classification_input(self):
         body = io.BytesIO(json.dumps({
             "ok": False,
             "error_code": 403,
@@ -119,163 +238,14 @@ class ProductTests(unittest.TestCase):
         self.assertEqual(caught.exception.error_code, 403)
         self.assertIn("BOT_VERIFIER_FORBIDDEN", caught.exception.description)
 
-    def test_permission_missing_stops_batch_without_claiming_remaining_targets(self):
-        api = ScriptedAPI({1: [TelegramAPIError("Forbidden: BOT_VERIFIER_FORBIDDEN", 403)]})
-        summary = verify_targets(api, (1, 2, 3))
-        self.assertEqual(summary, VerificationSummary(3, 0, 1, 2, 0, True))
-        self.assertEqual(api.verified, [1])
-
-    def test_permission_failure_after_success_preserves_completed_count_in_message(self):
-        api = ScriptedAPI({
-            2: [TelegramAPIError("Forbidden: BOT_VERIFIER_FORBIDDEN", 403)],
+    def test_configuration_includes_append_only_state_path(self):
+        settings = load_settings({
+            "TELEGRAM_BOT_TOKEN": "t",
+            "VERIFICATION_OWNER_IDS": "1,2",
+            "VERIFICATION_EXECUTIVE_IDS": "3",
+            "VERIFIER_STATE_PATH": "/state/events.jsonl",
         })
-        settings = Settings("token", (1, 2), (3,))
-        handle_message(
-            api,
-            settings,
-            {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1, "type": "private"}},
-            BOT_USERNAME,
-        )
-        self.assertEqual(api.verified, [1, 2])
-        message = api.messages[-1][1]
-        self.assertIn("Verificados antes da interrupção: 1", message)
-        self.assertIn("Falhas: 1", message)
-        self.assertIn("Não tentados: 1", message)
-
-    def test_inaccessible_target_is_counted_and_other_targets_continue(self):
-        api = ScriptedAPI({2: [TelegramAPIError("Bad Request: PEER_ID_INVALID", 400)]})
-        summary = verify_targets(api, (1, 2, 3))
-        self.assertEqual(summary, VerificationSummary(3, 2, 1, 0, 1, False))
-        self.assertEqual(api.verified, [1, 2, 3])
-
-    @patch("main.time.sleep")
-    def test_transient_error_retries_target_and_then_succeeds(self, sleep):
-        api = ScriptedAPI({2: [TelegramAPIError("Too Many Requests", 429, {"retry_after": 4}), True]})
-        summary = verify_targets(api, (1, 2, 3))
-        self.assertTrue(summary.complete)
-        self.assertEqual(api.verified, [1, 2, 2, 3])
-        sleep.assert_called_once_with(4)
-
-    @patch("main.time.sleep")
-    def test_transient_error_exhaustion_stays_failure(self, sleep):
-        api = ScriptedAPI({2: [
-            TelegramAPIError("server", 500),
-            TelegramAPIError("server", 500),
-            TelegramAPIError("server", 500),
-        ]})
-        summary = verify_targets(api, (1, 2, 3))
-        self.assertEqual(summary.succeeded, 2)
-        self.assertEqual(summary.failed, 1)
-        self.assertFalse(summary.complete)
-        self.assertEqual(api.verified, [1, 2, 2, 2, 3])
-        self.assertEqual(sleep.call_count, 2)
-
-    def test_non_owner_cannot_trigger_in_private(self):
-        api = ScriptedAPI()
-        settings = Settings("token", (1, 2), (3,))
-        handle_message(
-            api,
-            settings,
-            {"text": "/verify", "from": {"id": 99}, "chat": {"id": 99, "type": "private"}},
-            BOT_USERNAME,
-        )
-        self.assertEqual(api.verified, [])
-        self.assertEqual(api.messages[-1][1], "Ação não autorizada.")
-
-    def test_owner_verify_in_group_is_redirected_to_private_with_button(self):
-        api = ScriptedAPI()
-        settings = Settings("token", (1, 2), (3,))
-        handle_message(
-            api,
-            settings,
-            {"text": "/verify", "from": {"id": 1}, "chat": {"id": -100123, "type": "supergroup"}},
-            BOT_USERNAME,
-        )
-        self.assertEqual(api.verified, [])
-        self.assertEqual(len(api.messages), 1)
-        _, text, markup = api.messages[-1]
-        self.assertIn("conversa privada", text)
-        button = markup["inline_keyboard"][0][0]
-        self.assertEqual(button["text"], "Abrir conversa com o bot")
-        self.assertEqual(button["url"], f"https://t.me/{BOT_USERNAME}?start=verify")
-
-    def test_owner_only_gets_success_after_all_targets_succeed(self):
-        api = ScriptedAPI()
-        settings = Settings("token", (1, 2), (3,))
-        handle_message(
-            api,
-            settings,
-            {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1, "type": "private"}},
-            BOT_USERNAME,
-        )
-        self.assertEqual(api.verified, [1, 2, 3])
-        self.assertEqual(api.messages[-1][1], "Verificação concluída com sucesso para todos os 3 alvos.")
-
-    def test_inaccessible_feedback_tells_target_to_start_and_provides_share_button(self):
-        api = ScriptedAPI({2: [TelegramAPIError("Bad Request: PEER_ID_INVALID", 400)]})
-        settings = Settings("token", (1, 2), (3,))
-        handle_message(
-            api,
-            settings,
-            {"text": "/verify", "from": {"id": 1}, "chat": {"id": 1, "type": "private"}},
-            BOT_USERNAME,
-        )
-        _, message, markup = api.messages[-1]
-        self.assertIn("Verificação incompleta", message)
-        self.assertIn("Sucesso: 2", message)
-        self.assertIn("Falhas: 1", message)
-        self.assertIn("Alvos ainda não acessíveis ao bot: 1", message)
-        self.assertIn("enviar /start", message)
-        button = markup["inline_keyboard"][0][0]
-        self.assertEqual(button["text"], "Enviar instrução ao alvo")
-        self.assertTrue(button["url"].startswith("https://t.me/share/url?"))
-        parsed = urllib.parse.urlparse(button["url"])
-        query = urllib.parse.parse_qs(parsed.query)
-        self.assertEqual(query["url"][0], f"https://t.me/{BOT_USERNAME}?start=verify")
-        self.assertIn("verificação institucional", query["text"][0])
-
-    def test_start_is_only_acknowledged_for_configured_targets_in_private(self):
-        api = ScriptedAPI()
-        settings = Settings("token", (1, 2), (3,))
-        handle_message(
-            api,
-            settings,
-            {"text": "/start verify", "from": {"id": 3}, "chat": {"id": 3, "type": "private"}},
-            BOT_USERNAME,
-        )
-        self.assertEqual(len(api.messages), 1)
-        handle_message(
-            api,
-            settings,
-            {"text": "/start", "from": {"id": 99}, "chat": {"id": 99, "type": "private"}},
-            BOT_USERNAME,
-        )
-        self.assertEqual(len(api.messages), 1)
-
-    def test_prepare_requires_username_for_links(self):
-        api = ScriptedAPI()
-        self.assertEqual(prepare(api), BOT_USERNAME)
-        self.assertTrue(api.webhook_deleted)
-
-        api = ScriptedAPI()
-        api.get_me_result = {"id": 777, "is_bot": True}
-        with self.assertRaises(TelegramAPIError):
-            prepare(api)
-
-    def test_invalid_json_and_missing_result_fail_closed(self):
-        api = TelegramBotAPI("secret")
-        with patch("main.urllib.request.urlopen", return_value=Response(b"not-json")):
-            with self.assertRaises(TelegramAPIError):
-                api.get_me()
-        with patch("main.urllib.request.urlopen", return_value=Response({"ok": True})):
-            with self.assertRaises(TelegramAPIError):
-                api.get_me()
-
-    @patch("main.time.sleep")
-    def test_retry_helper_does_not_retry_nontransient_error(self, sleep):
-        with self.assertRaises(TelegramAPIError):
-            _with_transient_retry(lambda: (_ for _ in ()).throw(TelegramAPIError("Bad Request", 400)))
-        sleep.assert_not_called()
+        self.assertEqual(settings.state_path, "/state/events.jsonl")
 
 
 if __name__ == "__main__":
