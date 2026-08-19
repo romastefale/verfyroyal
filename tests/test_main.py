@@ -8,9 +8,11 @@ import main as m
 class FakeTelegram:
     def __init__(self):
         self.verify_calls = []
+        self.role_calls = []
         self.messages = []
         self.chats = {}
         self.outcomes = {}
+        self.role_outcomes = {}
 
     def get_chat(self, uid):
         value = self.chats.get(uid)
@@ -23,6 +25,15 @@ class FakeTelegram:
     def verify(self, uid):
         self.verify_calls.append(uid)
         value = self.outcomes.get(uid, True)
+        if isinstance(value, Exception):
+            raise value
+        if value is not True:
+            raise m.TelegramError("verifyUser did not return True", 400)
+        return True
+
+    def role(self, uid, description):
+        self.role_calls.append((uid, description))
+        value = self.role_outcomes.get(uid, True)
         if isinstance(value, Exception):
             raise value
         if value is not True:
@@ -179,6 +190,44 @@ class ProductTests(unittest.TestCase):
         self.assertNotIn(9, m.event_ids(self.store.read(), "verified"))
         self.store.add("verified", user_id=9, owner_id=1)
         self.assertIn(9, m.event_ids(self.store.read(), "verified"))
+
+    def test_role_disabled_does_not_touch_verification(self):
+        self.verified(1)
+        self.verified(9)
+        m.handle_message(self.api, self.store, self.settings, pm(1, "/role 9 Diretor"), "Bot")
+        self.assertEqual(self.api.role_calls, [])
+        self.assertIn("role_unavailable", self.api.messages[-1][1])
+        self.assertIn(9, m.event_ids(self.store.read(), "verified"))
+
+    def test_role_enabled_applies_description_to_verified_target(self):
+        settings = m.Settings("t", (1, 2), (3, 4), self.path, roles_enabled=True)
+        self.verified(1)
+        self.verified(9)
+        m.handle_message(self.api, self.store, settings, pm(1, "/role 9 Diretor de Operações"), "Bot")
+        self.assertEqual(self.api.role_calls, [(9, "Diretor de Operações")])
+
+    def test_role_requires_verified_target(self):
+        settings = m.Settings("t", (1, 2), (3, 4), self.path, roles_enabled=True)
+        self.verified(1)
+        self.start(9)
+        m.handle_message(self.api, self.store, settings, pm(1, "/role 9 Diretor"), "Bot")
+        self.assertEqual(self.api.role_calls, [])
+        self.assertIn("target_not_verified", self.api.messages[-1][1])
+
+    def test_role_rejects_description_over_70_characters(self):
+        settings = m.Settings("t", (1, 2), (3, 4), self.path, roles_enabled=True)
+        self.verified(1)
+        self.verified(9)
+        m.handle_message(self.api, self.store, settings, pm(1, "/role 9 " + "x" * 71), "Bot")
+        self.assertEqual(self.api.role_calls, [])
+        self.assertIn("invalid_role", self.api.messages[-1][1])
+
+    def test_role_uses_verify_user_custom_description_payload(self):
+        api = m.Telegram("t")
+        calls = []
+        api.call = lambda method, payload=None: calls.append((method, payload)) or True
+        self.assertTrue(api.role(9, "Diretor"))
+        self.assertEqual(calls, [("verifyUser", {"user_id": 9, "custom_description": "Diretor"})])
 
 
 if __name__ == "__main__":
