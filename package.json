@@ -1,0 +1,13 @@
+{
+  "name": "verfyroyal",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "echo 'No build needed'",
+    "dev": "node server.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
