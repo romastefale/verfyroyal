@@ -1,34 +1,52 @@
 # VerfyRoyal
 
-Minimal Telegram institutional verifier worker built for the official third-party verification flow. This project has been migrated to a native Node.js architecture to run cleanly as a Web Service on platforms like Railway.
+Single-owner Telegram bot that applies Telegram's official third-party verification (Bot API `verifyUser`, added in Bot API 8.2) to a fixed list of users when its owner sends `/verify`.
 
-## Runtime variables
+It is a webhook bot with no background process and no dependencies. Requests are handled by a Web-standard `Request -> Response` handler (`src/handler.js`). `server.js` adapts that handler to Node for Railway, where the service can run in **Serverless** mode and sleep while idle.
 
-- `TELEGRAM_BOT_TOKEN` — Telegram bot token. Keep it secret in Railway.
-- `VERIFICATION_OWNER_IDS` — exactly two co-owner Telegram user IDs, comma-separated. Both owners are verification targets and the only accounts authorized to trigger `/verify`.
-- `VERIFICATION_EXECUTIVE_IDS` — optional comma-separated Telegram user IDs for the authorized executive targets.
+## Prerequisite on Telegram's side
 
-No token or user ID is stored in the repository.
+`verifyUser` only works for a bot that Telegram has approved as a third-party verifier. Per [telegram.org/verify](https://telegram.org/verify), the organization needs an official bot verified by Telegram and then applies through @VerifyBot. Until then, every call answers 403 and the bot reports that verifier rights are missing. No code change is needed once rights are granted.
 
-## Operation
+## Variables
 
-The worker uses an Express web server for cloud health checks, while long-polling Telegram in the background. It ignores every command except `/verify`.
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | yes | Bot token. |
+| `TELEGRAM_WEBHOOK_SECRET` | yes | 32-256 characters of `A-Z a-z 0-9 _ -`, e.g. `openssl rand -hex 32`. Telegram sends it on every delivery; other requests are rejected. |
+| `VERIFICATION_OWNER_ID` | yes | The single Telegram user ID allowed to run `/verify`. The owner is always the first target. |
+| `VERIFICATION_TARGET_IDS` | no | Extra user IDs to verify, comma-separated. |
+| `VERIFICATION_CUSTOM_DESCRIPTION` | no | Up to 70 characters, sent as `custom_description`. Leave empty unless Telegram allows custom descriptions for your organization. |
+| `WEBHOOK_BASE_URL` | for `set-webhook` only | Public `https://` URL of the deployment. |
 
-When either configured owner sends `/verify`, the worker calls the official Bot API `verifyUser` method once for every unique configured owner and executive target. Rate limits (HTTP 429) are handled securely.
+No token or ID is stored in the repository.
 
-Before Telegram enables the bot's verifier capability, Telegram can reject the operation with a 403 Forbidden error. The same deployment is ready to work after that capability is enabled; no code change is required.
+## Endpoints
 
-## Run Locally
+- `POST /telegram/webhook`: Telegram updates. Needs the secret header.
+- `GET /health`: `200` when configuration is valid, `503` otherwise. Use it as the Railway health check path.
+
+## Deploy on Railway
+
+1. Deploy the repository; Railway runs `npm start`.
+2. Set the variables above in the service's **Variables** tab.
+3. Generate a public domain, set the health check path to `/health`, and optionally enable **Serverless** in the service settings.
+4. Register the webhook once (again whenever the domain or secret changes):
+
+   ```bash
+   WEBHOOK_BASE_URL=https://<your-domain> npm run set-webhook
+   ```
+
+   With the same variables loaded, this calls `setWebhook` with the secret, `allowed_updates: ["message"]`, `max_connections: 1` and `drop_pending_updates: true`, then prints `getWebhookInfo`.
+
+## Local development
 
 ```bash
-npm install
+cp .env.example .env   # fill it in
 npm run dev
+npm test
 ```
 
-## Railway Deployment
+Telegram can only deliver to a public HTTPS URL, so local runs need a tunnel to receive real updates. The tests use a fake Telegram and need no network.
 
-The repository is built natively for Railway. 
-
-1. Deploy the project from your GitHub repo.
-2. In your Railway service settings, add the required runtime variables in the **Variables** tab.
-3. The platform will automatically run `npm run start` and map the internal port.
+See [OPERATIONS.md](OPERATIONS.md) for exact behaviour and failure handling.

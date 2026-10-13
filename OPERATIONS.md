@@ -1,25 +1,47 @@
-# Operational invariants
+# Operational behaviour
 
-This service is designed to avoid reporting success when verification did not fully occur. A running process by itself is not considered sufficient evidence that verification succeeded. The service is built in native Node.js and relies on robust asynchronous checks.
+The bot never reports a verification it cannot prove. A user counts as verified only when `verifyUser` answers with the literal value `true`.
 
-## What counts as success
+## Who can trigger a run
 
-A verification is treated as successful only when the Bot API `verifyUser` method returns the literal value `true`.
+A run starts only for a message that meets all of these conditions:
 
-A `/verify` command is reported as fully successful only when every configured target returns `true`. If any target fails, the operator receives an incomplete result together with the counts of successes and failures. The underlying implementation never coerces or fakes a success payload.
+- it arrives on `/telegram/webhook` with the correct `X-Telegram-Bot-Api-Secret-Token` (checked in constant time; otherwise `401`);
+- it is a `message` (edits and other update types are ignored);
+- it is a private chat with the owner, sent by the owner, who is not a bot;
+- its first word is `/verify` (an `@BotName` suffix is allowed);
+- it is at most 5 minutes old, so a late delivery cannot start an unexpected run.
 
-## Failures that are expected and verifiable
+Anything else gets no reply and causes no Telegram call.
 
-- `BOT_VERIFIER_FORBIDDEN` (403): the bot does not yet have verifier capability. This is reported clearly to the operator and is not treated as success. Remedy: obtain the capability on the Telegram side and retry.
-- `429 Too Many Requests`: the service handles the rate limit seamlessly. It reads the `retry_after` parameter, pauses the exact asynchronous thread without blocking the web health-check server, and retries the target to guarantee completion.
-- Invalid token or bot identity: startup stops at `getMe`. The error is logged and the worker halts. Remedy: correct `TELEGRAM_BOT_TOKEN`.
-- Existing webhook: startup removes it with `deleteWebhook` so that `getUpdates` (long-polling) can be used cleanly.
-- Invalid or incomplete target configuration: startup stops before any user is contacted. Exactly two distinct owner IDs are required to operate securely.
-- Partial failure: the operator is informed with exact success and failure counts. No partial result is masked as a complete success.
-- Network instability: The bot's long-polling loop automatically recovers and reconnects after 2 seconds upon receiving an unexpected network or API error, preventing crashes.
+## A run
 
-## Why these checks exist
+Targets are the owner, then `VERIFICATION_TARGET_IDS`, deduplicated, verified one at a time. Each result is one of:
 
-The main risk is reporting success when verification did not actually complete. The checks above exist to keep that distinction clear and ensure data integrity.
+| Result | Cause |
+| --- | --- |
+| verified | `verifyUser` returned `true`. |
+| failed | Telegram answered with an error (e.g. 400), a non-`true` result, or a 429 that could not be retried. |
+| no verifier rights | Telegram answered 403. The run stops: every other call would fail the same way. |
+| unknown | No answer (network error or 10 s timeout). Verification may or may not have been applied. |
+| not attempted | Skipped after a 403, or because the run's time budget ran out. |
 
-The service focuses on not claiming success incorrectly. The Node.js worker isolates the Telegram polling layer from the Express web server, guaranteeing that health checks pass (e.g. on Railway) while the background worker safely handles network or API failure modes independently.
+The owner receives one message with the count and a line per target, including Telegram's error description.
+
+## Limits
+
+- **429:** waits `retry_after` (1 s if absent) and retries, at most twice per target, only when the wait is 10 s or less and fits in the time budget. Otherwise the target is reported as failed.
+- **Time budget:** 25 s per run, so the webhook answers before Telegram gives up on it. Targets not started in time are reported as not attempted.
+- **Request body:** 1 MB maximum (`413` above that).
+
+## Delivery and duplicates
+
+After the secret check, the webhook always answers `200`, even when a run fails. A non-2xx answer would make Telegram redeliver the update and run the verification again. `set-webhook` sets `max_connections: 1`, so updates are delivered one at a time and two runs never overlap. Re-running `/verify` simply re-applies the same verification.
+
+## Configuration errors
+
+Configuration is validated at start-up. If it is invalid, the error is logged (without secrets), `/health` answers `503` and the webhook answers `503` without doing anything. A deploy with bad variables is therefore not shown as healthy.
+
+## Logs
+
+Each run logs one line with the update ID and the result per target. The token is never logged: errors without an answer from Telegram keep only the error name, because some runtimes include the request URL, and with it the token, in error messages.
